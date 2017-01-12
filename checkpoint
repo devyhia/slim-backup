@@ -1,0 +1,2 @@
+model_checkpoint_path: "cvd_inception_resnet_v2_depth_150.tfmodel"
+all_model_checkpoint_paths: "cvd_inception_resnet_v2_depth_150.tfmodel"
