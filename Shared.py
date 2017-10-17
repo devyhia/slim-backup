@@ -8,9 +8,11 @@ import sys
 import random
 import time
 import os
+# from sklean import metrics
 
 from datasets import flowers
 from nets import resnet_v1
+from tqdm import tqdm
 # from preprocessing import inception_preprocessing
 
 from datasets import dataset_utils
@@ -24,8 +26,13 @@ import re
 
 import CatVsDogs
 
+load_training_data = lambda: CatVsDogs.prepare_data(fulldata=args.fulldata)
+# load_test_on_training_data = lambda: CatVsDogs.prepare_data(fulldata=args.fulldata)
+# load_testing_data = lambda: CatVsDogs.prepare_data(fulldata=args.fulldata)
+
 DIM= 224
 CHECKPOINTS_DIR= "checkpoints/"
+N_CLASSES = 2
 
 def update_screen(msg):
     sys.stdout.write(msg)
@@ -59,14 +66,13 @@ def define_model(model, model_name, model_func):
 
     # Define the model inputs / placeholders
     model.X = tf.placeholder(tf.float32, shape=[None, DIM,DIM,3], name='X')
-    model.y = tf.placeholder(tf.float32, shape=[None, 2], name='y')
+    model.y = tf.placeholder(tf.float32, shape=[None, N_CLASSES], name='y')
     model.learning_rate = tf.placeholder(tf.float32, shape=[], name='learning_rate')
 
     model.name = model_name
     # Just in case a previous run was closed using a halt file.
     if os.path.isfile("{}.halt".format(model.name)):
         os.remove("{}.halt".format(model.name))
-
 
     model.ImageNetMean = tf.constant([123.68, 116.779, 103.939], dtype=tf.float32, shape=[1, 1, 1, 3], name='img_mean')
     model.X_Norm = model.X - model.ImageNetMean
@@ -82,6 +88,9 @@ def define_model(model, model_name, model_func):
     model.correct_prediction = tf.equal(tf.argmax(model.probs, 1), tf.argmax(model.y, 1))
     model.wrong_prediction = tf.not_equal(tf.argmax(model.probs, 1), tf.argmax(model.y, 1))
     model.accuracy = tf.reduce_mean(tf.cast(model.correct_prediction, tf.float32))
+
+    # Confusion Matrix
+    model.confusion_matrix = tf.contrib.metrics.confusion_matrix(tf.argmax(model.y, 1), tf.argmax(model.probs, 1), name='confusion_matrix')
 
     # Define Tensorboard Summaries
     model.summaries += [tf.histogram_summary('Correct Predictions', tf.cast(model.correct_prediction, tf.int32))]
@@ -108,8 +117,8 @@ def define_model(model, model_name, model_func):
 
 def iterate_minibatches(X,y, size):
     '''Iterates over X and y in batches of a certain size'''
-    if X.shape[0] % size > 0:
-        raise "The minibatch size should be a divisor of the batch size."
+    # if X.shape[0] % size > 0:
+    #     raise "The minibatch size should be a divisor of the batch size."
 
     idx = np.arange(X.shape[0])
     np.random.shuffle(idx) # in-place shuffling
@@ -118,19 +127,28 @@ def iterate_minibatches(X,y, size):
         _idx = idx[i*size:(i+1)*size]
         yield X[_idx], y[_idx]
 
-def calculate_loss(model, sess, Xt, yt, size=1000, step=10):
+def calculate_loss(model, sess, Xt, yt, size=1000, step=10, validate=False):
     '''Calculate the loss of the model on a random sample of a given size'''
     fc3ls = []
     sample_idx = random.sample(range(0, Xt.shape[0]), size)
-    for i in range(size / step):
-        # model.y: yt[sample_idx[i*step:(i+1)*step]]
-        fc3l = sess.run(model.logits, feed_dict={model.X: Xt[sample_idx[i*step:(i+1)*step]]})
-        fc3ls.append(fc3l)
+
+    with tqdm(desc='Calculate Loss', total=size) as pbar:
+        for i in range(int(np.ceil(float(size) / step))):
+            # model.y: yt[sample_idx[i*step:(i+1)*step]]
+            fc3l = sess.run(model.logits, feed_dict={model.X: Xt[sample_idx[i*step:(i+1)*step]]})
+            fc3ls.append(fc3l)
+            pbar.update(fc3l.shape[0])
 
     fc3ls = np.vstack(fc3ls)
-    loss, accuracy, summary = sess.run([model.total_loss, model.accuracy, model.tf_summary], feed_dict={model.X: Xt[sample_idx], model.logits: fc3ls, model.y: yt[sample_idx]})
 
-    return loss, accuracy, summary
+    if validate:
+        ret = [model.total_loss, model.accuracy, model.confusion_matrix]
+    else:
+        ret = [model.total_loss, model.accuracy, model.tf_summary]
+
+    loss, accuracy, summary_or_confusion_matrix = sess.run(ret, feed_dict={model.X: Xt[sample_idx], model.logits: fc3ls, model.y: yt[sample_idx]})
+
+    return loss, accuracy, summary_or_confusion_matrix
 
 def graceful_halt(model, t_start_training):
     # Save Trained Model
@@ -205,7 +223,7 @@ def train_model(model, sess, X, y, val_X, val_y, epochs=30, minibatch_size=50, o
 
 def load_model(model, sess):
     sess.run(tf.initialize_all_variables())
-    model.saver.restore(sess, "{}.tfmodel".format(model.name))
+    model.saver.restore(sess, "./{}.tfmodel".format(model.name))
 
 def predict_proba(model, sess, X, step=10):
     fc3ls = []
@@ -213,11 +231,11 @@ def predict_proba(model, sess, X, step=10):
     size = X.shape[0]
     sample_idx = random.sample(range(0, size), size)
     reverse_idx = list(map(sample_idx.index, range(0,size)))
-
-    for i in range(size / step):
-        update_screen("\rpredict_proba: {} / {}".format(i*step, size))
-        fc3l = sess.run(model.logits, feed_dict={model.X: X[sample_idx[i*step:(i+1)*step]]})
-        fc3ls.append(fc3l)
+    with tqdm(desc="Predictions", total=size) as pbar:
+        for i in range(int(np.ceil(float(size) / step))):
+            fc3l = sess.run(model.logits, feed_dict={model.X: X[sample_idx[i*step:(i+1)*step]]})
+            fc3ls.append(fc3l)
+            pbar.update(fc3l.shape[0])
 
     probs = sess.run(model.probs, feed_dict={model.logits: np.vstack(fc3ls)})
 
@@ -251,6 +269,7 @@ def define_parser(klass='Model'):
     parser.add_argument('--epochs', default='30', help='Number of epochs')
     parser.add_argument('--resume', default="no", help='Resume from previous checkpoint')
     parser.add_argument('--test', dest='test', default=False, action='store_true', help='Generate test predictions')
+    parser.add_argument('--validate', dest='validate', default=False, action='store_true', help='Generate validate predictions')
     parser.add_argument('--on-training', dest='on_training', default=False, action='store_true', help='Test on training')
     parser.add_argument('--bag', default="no", help='Bagging split')
     parser.add_argument('--fulldata', dest='fulldata', default=False, action='store_true', help='Train on full data?')
@@ -259,12 +278,17 @@ def define_parser(klass='Model'):
 def test(sess, model, args):
     print("+++++ TESTING +++++")
     model.load_model(sess)
-    ids, Xt = CatVsDogs.prepare_test_data()
-    ids = np.array(ids).astype(np.int)
+    # ids, Xt = CatVsDogs.prepare_test_data()
+    X, y, Xt, yt = load_training_data()
+    # ids = np.array(ids).astype(np.int)
 
+    update_screen('\nGenerating Validation Predictions ...\n')
     prob = model.predict_proba(sess, Xt, step=50)
+    np.save("Prediction.Xt.{}.npy".format(args.name), prob)
 
-    np.save("CatVsDogs.Xt.{}.npy".format(args.name), prob)
+    update_screen('\nGenerating Training Predictions ...\n')
+    prob = model.predict_proba(sess, X, step=50)
+    np.save("Prediction.X.{}.npy".format(args.name), prob)
 
 def test_on_training(sess, model, args):
     print("+++++ TESTING ON TRAINING +++++")
@@ -277,17 +301,29 @@ def test_on_training(sess, model, args):
 
 def train(sess, model, args):
     print("+++++ TRAINING +++++")
-    X, y, Xt, yt = CatVsDogs.prepare_data(fulldata=args.fulldata)
+    X, y, Xt, yt = load_training_data()
     model.train(sess, X, y, Xt, yt, epochs=int(args.epochs), minibatch_size=10)
+
+def validate(sess, model, args):
+    print("+++++ VALIDATION +++++")
+    model.load_model(sess)
+
+    X, y, Xt, yt = load_training_data()
+
+    loss, accuracy, confusion_matrix = calculate_loss(model, sess, Xt, yt, size=Xt.shape[0], validate=True)
+
+    print("Loss:\t\t{:.4f}".format(loss))
+    print("Accuracy:\t\t{:.4f}".format(accuracy))
+    print("Confusion Matrix:\t\t{}".format(confusion_matrix))
+
 
 def main(ModelClass, args):
     select_gpu(args.gpu)
     model = ModelClass(args.name)
     sess = tf.Session()
-    if not args.test:
-        train(sess, model, args)
-    else:
-        if args.on_training:
-            test_on_training(sess, model, args)
-        else:
-            test(sess, model, args)
+
+    if args.validate: return validate(sess, model, args)
+    if args.test and args.on_training: return test_on_training(sess, model, args)
+    if args.test: return test(sess, model, args)
+
+    return train(sess, model, args)
